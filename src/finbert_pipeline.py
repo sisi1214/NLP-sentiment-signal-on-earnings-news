@@ -301,6 +301,16 @@ def add_classification_labels(df: pd.DataFrame, return_col: str = "ret_1d") -> p
 
     out["finbert_signal"] = out["finbert_positive"] - out["finbert_negative"]
     out["ret_1d_label"] = np.where(out[return_col] > 0.0, 1, 0)
+    # also create 7d and 28d labels for easier experimentation
+    if "ret_7d" in out.columns:
+        out["ret_7d_label"] = np.where(out["ret_7d"] > 0.0, 1, 0)
+    else:
+        out["ret_7d_label"] = np.nan
+
+    if "ret_28d" in out.columns:
+        out["ret_28d_label"] = np.where(out["ret_28d"] > 0.0, 1, 0)
+    else:
+        out["ret_28d_label"] = np.nan
     out["buy_hold_sell"] = np.select(
         [out[return_col] < -0.02, out[return_col] > 0.02],
         ["sell", "buy"],
@@ -329,7 +339,7 @@ def run_classifier(df: pd.DataFrame, target_col: str = "ret_1d_label") -> tuple[
         }, {}
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=42, stratify=y)
-    clf = LogisticRegression(max_iter=2000, random_state=42)
+    clf = LogisticRegression(max_iter=2000, random_state=42, class_weight="balanced")
     clf.fit(X_train, y_train)
     preds = clf.predict(X_test)
 
@@ -348,6 +358,7 @@ def main() -> None:
     parser.add_argument("--transcripts", type=str, default="Transcripts", help="Folder containing transcript text files.")
     parser.add_argument("--limit", type=int, default=None, help="Optional limit for quick testing on a few transcripts.")
     parser.add_argument("--output", type=str, default="finbert_transcript_scores.csv", help="CSV output path for the scored results.")
+    parser.add_argument("--cv", action="store_true", help="Run 5-fold stratified cross-validation on ret_7d_label and exit.")
     args = parser.parse_args()
 
     transcripts_df = load_transcripts(args.transcripts)
@@ -357,6 +368,35 @@ def main() -> None:
     sentiment_df = build_finbert_sentiment_table(transcripts_df, limit=args.limit)
     sentiment_df = attach_forward_returns(sentiment_df)
     sentiment_df = add_classification_labels(sentiment_df)
+
+    if args.cv:
+        # run 5-fold stratified CV on ret_7d_label using balanced logistic regression
+        from sklearn.model_selection import StratifiedKFold, cross_val_score, cross_val_predict
+        from sklearn.metrics import confusion_matrix, classification_report
+
+        if "ret_7d_label" not in sentiment_df.columns or sentiment_df["ret_7d_label"].isna().all():
+            print("No ret_7d_label available after processing — aborting CV")
+            return
+
+        data = sentiment_df.dropna(subset=["ret_7d_label"]).copy()
+        X = data[["finbert_positive", "finbert_negative", "finbert_neutral", "finbert_compound"]].fillna(0.0)
+        y = data["ret_7d_label"].astype(int)
+        print(f"n_rows with ret_7d_label: {len(y)}")
+        if len(y) < 10 or y.nunique() < 2:
+            print("Not enough data or only one class present — aborting CV")
+            return
+
+        clf = LogisticRegression(max_iter=2000, class_weight="balanced", random_state=42)
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        print("Running cross_val_score (accuracy) ...")
+        scores = cross_val_score(clf, X, y, cv=cv, scoring="accuracy")
+        preds = cross_val_predict(clf, X, y, cv=cv)
+        cm = confusion_matrix(y, preds)
+        print("cv_scores:", scores.tolist())
+        print("mean:", float(scores.mean()), "std:", float(scores.std()))
+        print("confusion_matrix:\n", cm)
+        print("classification_report:\n", classification_report(y, preds, digits=4))
+        return
 
     # Print correlations for multiple horizons to check signal strength
     for col in ["ret_1d", "ret_7d", "ret_28d"]:
